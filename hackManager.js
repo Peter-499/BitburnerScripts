@@ -7,7 +7,7 @@ import { multiscan, gainRootAccess } from "utils.js";
 
 //filter all servers that have money & are currently hackable,
 //then find the one that has the most money
-async function sort(ns, arr) {
+function sort(ns, arr) {
   //func used in sorting algorithm
   function format(ns, arr, elem) {
     let newarr = [];
@@ -64,6 +64,7 @@ async function sort(ns, arr) {
 export async function main(ns) {
   ns.disableLog("ALL");
   ns.enableLog("print");
+  ns.clearLog();
   ns.tail();
   let reservedRAM = ns.args[0];
   if (reservedRAM == null) {
@@ -73,10 +74,20 @@ export async function main(ns) {
   let Loop = 0
   let Cycle = 0;
   while (true) {
-    ns.toast("Begin new hack cycle", "info", 2500);
+    ns.toast("Begin new hack cycle", "info", 3000);
     //have this run every cycle to always be targetting the highest worth server
-    let ServerList = await sort(ns, multiscan(ns, "home"));
+    let ServerList = sort(ns, multiscan(ns, "home"));
     const Target = ServerList[0];
+    ns.write("/home/hackLog.txt", "Target: " + Target + "\n");
+    //get all pservs to always have up to date info on RAM capacity/num of servers if early game 
+    let HostServs = ["home"];
+    ns.getPurchasedServers().forEach(serv => {
+      // writes needed scripts to host server
+      ns.scp("ScriptedGrow.js", serv);
+      ns.scp("ScriptedHack.js", serv);
+      ns.scp("ScriptedWeaken.js", serv);
+      HostServs.push(serv);
+    })
     ns.print("Target: " + Target);
 
     //time math 
@@ -91,11 +102,17 @@ export async function main(ns) {
 
     //make sure target is at minSec and maxMoney
     if (ns.getServerMaxMoney(Target) != ns.getServerMoneyAvailable(Target)) {
-      ns.write("/home/hackLog.txt", "Loop Number: " + Loop.toString() + "includes a grow cycle.\n");
+      ns.write("/home/hackLog.txt", "Begin Growth Cycle - Loop Number: " + Loop.toString() + "\n" + "\n");
+      ns.write("/home/hackLog.txt", "Target Maximum Cash Avaliable: " + ns.getServerMaxMoney(Target) + "\n");
+      ns.write("/home/hackLog.txt", "Target Current Cash Avaliable: " + ns.getServerMoneyAvailable(Target) + "\n");
+      ns.write("/home/hackLog.txt", "Target Minimum Security Level: " + ns.getServerMinSecurityLevel(Target) + "\n");
+      ns.write("/home/hackLog.txt", "Target Current Security Level: " + ns.getServerSecurityLevel(Target) + "\n" + "\n");
+      ns.print("Loop " + Loop.toString() + " includes a grow cycle.\n");
 
-      const growThreads = Math.ceil(ns.growthAnalyze(Target, (ns.getServerMaxMoney(Target) / ns.getServerMoneyAvailable(Target))));
-      const weakenThreadsG = 1;
-      while (Math.ceil(ns.growthAnalyzeSecurity(growThreads, Target)) > weakenAnalyze(weakenThreadsG)) {
+      const groThreads = Math.ceil((ns.growthAnalyze(Target, (ns.getServerMaxMoney(Target) / ns.getServerMoneyAvailable(Target)))) / 64);
+      let secIncreaseG = Math.ceil(ns.growthAnalyzeSecurity(groThreads, Target) / 64);
+      let weakenThreadsG = 1;
+      while (Math.ceil(ns.weakenAnalyze(weakenThreadsG) < secIncreaseG * 1.1)) {
         weakenThreadsG += 3;
         await ns.sleep(1)
       }
@@ -103,25 +120,88 @@ export async function main(ns) {
       const weakTime = ns.getWeakenTime(Target);
       const growExecTime = weakTime - growTime + 20;
 
-      ns.exec("Scriptedgrow.js", growThreads, growExecTime, Target);
-      ns.exec("ScriptedWeaken.js", weakenThreadsG, Target);
-      ns.sleep(Cycle);
-      continue;
+      const requiredRAM = (
+        ns.getScriptRam("ScriptedGrow.js") * groThreads +
+        ns.getScriptRam("ScriptedWeaken.js") * weakenThreadsG);
+
+      //execution loop - threads were divided into 64ths to fit across servers as needed
+      let iterations = 64
+      let serv = 0
+      while (iterations > 0) {
+        //if on home, consider reserved RAM
+        if (HostServs[serv] == "home") {
+          while (ns.getServerMaxRam(HostServs[serv]) - ns.getServerUsedRam(HostServs[serv]) - reservedRAM > requiredRAM) {
+            await ns.exec("ScriptedGrow.js", HostServs[serv], groThreads, groThreads, growExecTime, Target);
+            await ns.exec("ScriptedWeaken.js", HostServs[serv], weakenThreadsG, weakenThreadsG, Target);
+            iterations--;
+            await ns.sleep(20)
+          }
+          serv++
+        }
+        //if not on home, disregard reserved RAM
+        else {
+          while (ns.getServerMaxRam(HostServs[serv]) - ns.getServerUsedRam(HostServs[serv]) > requiredRAM) {
+            await ns.exec("ScriptedGrow.js", HostServs[serv], groThreads, groThreads, growExecTime, Target);
+            await ns.exec("ScriptedWeaken.js", HostServs[serv], weakenThreadsG, weakenThreadsG, Target);
+            iterations--;
+            await ns.sleep(20)
+          }
+          serv++
+        }
+      }
+      ns.print("growth cycle executed. Time to complete: " + ns.tFormat(Cycle))
+      await ns.sleep(Cycle);
+      ns.print("growth cycle complete")
     }
 
-    //get all pservs to always have up to date info on RAM capacity/num of servers if early game 
-    let HostServs = ["home"];
-    ns.getPurchasedServers().forEach(serv => {
-      HostServs.push(serv);
-    })
-    ns.print("Length: " + HostServs.length)
+    if (ns.getServerSecurityLevel > ns.getServerMinSecurityLevel) {
+      ns.write("/home/hackLog.txt", "Begin Weaken Cycle - Loop Number: " + Loop.toString() + "\n" + "\n");
+      ns.write("/home/hackLog.txt", "Target Minimum Security Level: " + ns.getServerMinSecurityLevel(Target) + "\n");
+      ns.write("/home/hackLog.txt", "Target Current Security Level: " + ns.getServerSecurityLevel(Target) + "\n" + "\n");
+      ns.print("Loop " + Loop.toString() + " includes a weaken cycle.\n");
+
+      //Thread Math to lower Sec to min
+      let secDif = Math.ceil((ns.getServerMinSecurityLevel - ns.getServerSecurityLevel) / 64);
+      let weakenThreads = 1;
+      while (Math.ceil(ns.weakenAnalyze(weakenThreads) < secDif * 1.1)) {
+        weakenThreads += 3;
+        await ns.sleep(1)
+      }
+      const requiredRAM = (ns.getScriptRam("ScriptedWeaken.js") * weakenThreads);
+      //execution loop - threads were divided into 64ths to fit across servers as needed
+      let iterations = 64
+      let serv = 0
+      while (iterations > 0) {
+        //if on home, consider reserved RAM
+        if (HostServs[serv] == "home") {
+          while (ns.getServerMaxRam(HostServs[serv]) - ns.getServerUsedRam(HostServs[serv]) - reservedRAM > requiredRAM) {
+            await ns.exec("ScriptedWeaken.js", HostServs[serv], weakenThreads, weakenThreads, Target);
+            iterations--;
+            await ns.sleep(20)
+          }
+          serv++
+        }
+        //if not on home, disregard reserved RAM
+        else {
+          while (ns.getServerMaxRam(HostServs[serv]) - ns.getServerUsedRam(HostServs[serv]) > requiredRAM) {
+            await ns.exec("ScriptedWeaken.js", HostServs[serv], weakenThreads, weakenThreads, Target);
+            iterations--;
+            await ns.sleep(20)
+          }
+          serv++
+        }
+      }
+      ns.print("weaken cycle executed. Time to complete: " + ns.tFormat(Cycle))
+      await ns.sleep(Cycle);
+      ns.print("weaken cycle complete")
+    }
 
 
     //threads math
-    let growThreads = Math.ceil(ns.growthAnalyze(Target, 2));
+    let groThreads = Math.ceil(ns.growthAnalyze(Target, 2));
     let hackThreads = Math.ceil(ns.hackAnalyzeThreads(Target, ns.getServerMoneyAvailable(Target) / 2));
     let secIncreaseH = Math.ceil(ns.hackAnalyzeSecurity(hackThreads, Target));
-    let secIncreaseG = Math.ceil(ns.growthAnalyzeSecurity(growThreads, Target));
+    let secIncreaseG = Math.ceil(ns.growthAnalyzeSecurity(groThreads, Target));
     let weakenThreadsH = 1;//to counter hack
     let weakenThreadsG = 1;//to counter grow
 
@@ -135,20 +215,19 @@ export async function main(ns) {
     }
 
     //ram needed to run all 4 scripts at thread count
-    const requiredRAM = (ns.getScriptRam("ScriptedHack.js")*hackThreads +
-      ns.getScriptRam("ScriptedWeaken.js")*weakenThreadsH +
-      ns.getScriptRam("ScriptedGrow.js")*growThreads +
-      ns.getScriptRam("ScriptedWeaken.js")*weakenThreadsG);
-    ns.print("Req RAM: " + requiredRAM);
+    const requiredRAM = (ns.getScriptRam("ScriptedHack.js") * hackThreads +
+      ns.getScriptRam("ScriptedWeaken.js") * weakenThreadsH +
+      ns.getScriptRam("ScriptedGrow.js") * groThreads +
+      ns.getScriptRam("ScriptedWeaken.js") * weakenThreadsG);
 
     //error detection
-    if (hackThreads < 1 || weakenThreadsG < 1 || weakenThreadsH < 1 || growThreads < 1) {
+    if (hackThreads < 1 || weakenThreadsG < 1 || weakenThreadsH < 1 || groThreads < 1) {
       ns.toast("Error in Hack Manager!", "error", 5000);
       ns.print("Uh oh! something broke!");
       ns.print("hack threads: " + hackThreads);
       ns.print("WeakenH threads: " + weakenThreadsH);
       ns.print("WeakenG threads: " + weakenThreadsG);
-      ns.print("grow threads: " + growThreads);
+      ns.print("grow threads: " + groThreads);
       ns.exit();
     }
     if (weakTime < growTime || weakTime < hackTime) {
@@ -166,40 +245,40 @@ export async function main(ns) {
     }
 
     //logging
-    ns.write("/home/hackLog.txt", "Loop Number: " + Loop.toString() + "\n");
-    ns.write("/home/hackLog.txt", "Target: " + Target + "\n");
-    ns.write("/home/hackLog.txt", "Target Maximum Cash Avaliable: " + ns.getServerMoneyAvailable(Target) + "\n");
+    ns.write("/home/hackLog.txt", "Begin Regular Cycle - Loop Number: " + Loop.toString() + "\n");
+    ns.write("/home/hackLog.txt", "Target Maximum Cash Avaliable: " + ns.getServerMaxMoney(Target) + "\n");
     ns.write("/home/hackLog.txt", "Target Current Cash Avaliable: " + ns.getServerMoneyAvailable(Target) + "\n");
     ns.write("/home/hackLog.txt", "Target Minimum Security Level: " + ns.getServerMinSecurityLevel(Target) + "\n");
     ns.write("/home/hackLog.txt", "Target Current Security Level: " + ns.getServerSecurityLevel(Target) + "\n");
     ns.write("/home/hackLog.txt", "\n");
-    
+
+
     //execution loop
     for (let i = 0; i < HostServs.length; i++) {
       //if on home, consider reserved RAM
-      if (HostServs[i] == 'home') {
+      if (HostServs[i] == "home") {
         while (ns.getServerMaxRam(HostServs[i]) - ns.getServerUsedRam(HostServs[i]) - reservedRAM > requiredRAM) {
-          ns.exec("ScriptedHack.js", hackThreads, hackExecTime, Target);
-          ns.exec("ScriptedWeaken.js", weakenThreadsH, Target);
-          ns.exec("Scriptedgrow.js", growThreads, growExecTime, Target);
-          ns.exec("ScriptedWeaken.js", weakenThreadsG, Target);
-          ns.print("Beginning new cycle"); //will only execute once - only one home
+          ns.exec("ScriptedHack.js", "home", hackThreads, hackThreads, hackExecTime, Target);
+          ns.exec("ScriptedWeaken.js", "home", weakenThreadsH, weakenThreadsH, Target);
+          ns.exec("ScriptedGrow.js", "home", groThreads, groThreads, growExecTime, Target);
+          ns.exec("ScriptedWeaken.js", "home", weakenThreadsG, weakenThreadsG, Target);
         }
       }
       //if not on home, disregard reserved RAM
-      if (HostServs[i] != 'home') {
+      else {
         while (ns.getServerMaxRam(HostServs[i]) - ns.getServerUsedRam(HostServs[i]) > requiredRAM) {
-          ns.exec("ScriptedHack.js", hackThreads, hackExecTime, Target);
-          ns.exec("ScriptedWeaken.js", weakenThreadsH, Target);
-          ns.exec("Scriptedgrow.js", growThreads, growExecTime, Target);
-          ns.exec("ScriptedWeaken.js", weakenThreadsG, Target);
+          ns.exec("ScriptedHack.js", HostServs[i], hackThreads, hackThreads, hackExecTime, Target);
+          ns.exec("ScriptedWeaken.js", HostServs[i], weakenThreadsH, weakenThreadsH, Target);
+          ns.exec("ScriptedGrow.js", HostServs[i], groThreads, groThreads, growExecTime, Target);
+          ns.exec("ScriptedWeaken.js", HostServs[i], weakenThreadsG, weakenThreadsG, Target);
         }
       }
-      //sleep for the amount of time it will take for all code to execute
-      //before attempting to run more code
-      ns.print("Ending Loop "+Loop)
-      Loop += 1;
-      await ns.sleep(Cycle);
+      await ns.sleep(0)
     }
+    //sleep for the amount of time it will take for all code to execute
+    //before attempting to run more code
+    ns.print("Hack cycle executed. Time to complete: " + ns.tFormat(Cycle))
+    await ns.sleep(Cycle);
+    Loop += 1;
   }
 }
